@@ -215,8 +215,16 @@ where
                 _ => FulfillmentType::LockAndFulfill,
             };
 
+            // OPTIMIZATION: Skip non-LockAndFulfill orders for maximum speed
+            if fulfillment_type != FulfillmentType::LockAndFulfill {
+                tracing::debug!(
+                    "🚫 跳过订单 {request_id:x} - 非LockAndFulfill类型: {fulfillment_type:?}",
+                );
+                continue;
+            }
+
             tracing::info!(
-                "Found open order: {request_id:x} with request status: {req_status:?}, preparing to process with fulfillment type: {fulfillment_type:?}",
+                "🎯 发现开放订单: {request_id:x} 状态: {req_status:?}, 准备处理 LockAndFulfill 类型订单",
             );
 
             let new_order = OrderRequest::new(

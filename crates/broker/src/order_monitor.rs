@@ -231,7 +231,7 @@ where
             .context("Failed to get request status")
             .map_err(OrderMonitorErr::RpcErr)?;
         if order_status != RequestStatus::Unknown {
-            tracing::info!("Request {:x} not open: {order_status:?}, skipping", request_id);
+            tracing::info!("❌ 请求 {:x} 状态不开放: {order_status:?}, 跳过处理", request_id);
             // TODO: fetch some chain data to find out who / and for how much the order
             // was locked in at
             return Err(OrderMonitorErr::AlreadyLocked);
@@ -243,7 +243,7 @@ where
             .await
             .context("Failed to check if request is locked")?;
         if is_locked {
-            tracing::warn!("Request 0x{:x} already locked: {order_status:?}, skipping", request_id);
+            tracing::warn!("⚠️ 请求 0x{:x} 已被锁定: {order_status:?}, 跳过处理", request_id);
             return Err(OrderMonitorErr::AlreadyLocked);
         }
 
@@ -253,7 +253,7 @@ where
         };
 
         tracing::info!(
-            "Locking request: 0x{:x} for stake: {}",
+            "🔐 正在锁定请求: 0x{:x} 质押金额: {}",
             request_id,
             order.request.offer.lockStake
         );
@@ -432,6 +432,15 @@ where
         }
 
         fn is_target_time_reached(order: &OrderRequest, current_block_timestamp: u64) -> bool {
+            // OPTIMIZATION: LockAndFulfill orders bypass target timestamp checks for maximum speed
+            if order.fulfillment_type == FulfillmentType::LockAndFulfill {
+                tracing::trace!(
+                    "⚡ 速度优化: LockAndFulfill订单 {:x} 绕过目标时间戳检查",
+                    order.request.id
+                );
+                return true;
+            }
+
             // Note: this could use current timestamp, but avoiding cases where clock has drifted.
             match order.target_timestamp {
                 Some(target_timestamp) => {
@@ -530,7 +539,7 @@ where
                     let request_id = order.request.id;
                     match self.lock_order(order).await {
                         Ok(lock_price) => {
-                            tracing::info!("Locked request: 0x{:x}", request_id);
+                            tracing::info!("🔒 成功锁定请求: 0x{:x}", request_id);
                             if let Err(err) = self.db.insert_accepted_request(order, lock_price).await {
                                 tracing::error!(
                                     "FATAL STAKE AT RISK: {} failed to move from locking -> proving status {}",
@@ -542,18 +551,18 @@ where
                         Err(ref err) => {
                             match err {
                                 OrderMonitorErr::UnexpectedError(inner) => {
-                                    tracing::error!(
-                                        "Failed to lock order: {order_id} - {} - {inner:?}",
-                                        err.code()
-                                    );
+                                                                    tracing::error!(
+                                    "❌ 锁定订单失败: {order_id} - {} - {inner:?}",
+                                    err.code()
+                                );
                                 }
                                 OrderMonitorErr::AlreadyLocked => {
                                     // For order already locked, we don't need to print the error backtrace.
-                                    tracing::warn!("Soft failed to lock request: {order_id} - {}", err.code());
+                                    tracing::warn!("⚠️ 订单锁定失败 (已被锁定): {order_id} - {}", err.code());
                                 }
                                 _ => {
                                     tracing::warn!(
-                                        "Soft failed to lock request: {order_id} - {} - {err:?}",
+                                        "⚠️ 锁定请求失败: {order_id} - {} - {err:?}",
                                         err.code()
                                     );
                                 }
@@ -640,8 +649,9 @@ where
         let mut final_orders: Vec<Arc<OrderRequest>> = Vec::with_capacity(capacity_granted);
 
         // Get current gas price and available balance
-        let gas_price =
-            self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
+        // OPTIMIZATION: Use hardcoded gas price to avoid RPC calls
+        let gas_price = 2_000_000_000u128; // 2 gwei - ultra low cost competitive pricing
+        // Original: self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
         let available_balance_wei = self
             .provider
             .get_balance(self.provider.default_signer_address())
@@ -751,7 +761,20 @@ where
                 // Calculate total cycles including application proof, assessor, and set builder estimates
                 let total_cycles = order_cycles + config.additional_proof_cycles;
 
-                let proof_time_seconds = total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz);
+                // OPTIMIZATION: Use aggressive time estimation for LockAndFulfill orders
+                let proof_time_seconds = if order.fulfillment_type == FulfillmentType::LockAndFulfill {
+                    // Use 10x faster estimation for LockAndFulfill to be more competitive
+                    let aggressive_time = total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz * 10);
+                    tracing::debug!(
+                        "⚡ 速度优化: LockAndFulfill订单 {:x} 使用激进时间估算: {}秒 (原估算: {}秒)",
+                        order.request.id,
+                        aggressive_time,
+                        total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz)
+                    );
+                    aggressive_time
+                } else {
+                    total_cycles.div_ceil(1_000).div_ceil(peak_prove_khz)
+                };
                 let completion_time = prover_available_at + proof_time_seconds;
                 let expiration = order.expiry();
 
@@ -833,10 +856,12 @@ where
     ) -> Result<(), OrderMonitorErr> {
         let mut last_block = 0;
         let mut first_block = 0;
+        // OPTIMIZATION: Use 1ms interval for maximum order processing speed
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now(),
-            tokio::time::Duration::from_secs(self.block_time),
+            tokio::time::Duration::from_millis(1),
         );
+        // Original: tokio::time::Duration::from_secs(self.block_time),
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut new_orders = self.priced_order_rx.lock().await;
@@ -1065,7 +1090,6 @@ pub(crate) mod tests {
                 boundless_market_address: self.market_address,
                 chain_id: self.anvil.chain_id(),
                 total_cycles: None,
-                cached_id: Default::default(),
             })
         }
     }
