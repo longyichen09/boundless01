@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 use boundless_market::contracts::{
     boundless_market::{BoundlessMarketService, MarketError},
     IBoundlessMarket::IBoundlessMarketErrors,
-    RequestStatus, TxnErr,
+    RequestId, RequestStatus, TxnErr,
 };
 use boundless_market::selector::SupportedSelectors;
 use moka::{future::Cache, Expiry};
@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
+use std::str::FromStr;
 
 /// Hard limit on the number of orders to concurrently kick off proving work for.
 const MAX_PROVING_BATCH_SIZE: u32 = 10;
@@ -223,40 +224,14 @@ where
 
     async fn lock_order(&self, order: &OrderRequest) -> Result<U256, OrderMonitorErr> {
         let request_id = order.request.id;
-
-        let order_status = self
-            .market
-            .get_status(request_id, Some(order.request.expires_at()))
-            .await
-            .context("Failed to get request status")
-            .map_err(OrderMonitorErr::RpcErr)?;
-        if order_status != RequestStatus::Unknown {
-            tracing::info!("❌ 请求 {:x} 状态不开放: {order_status:?}, 跳过处理", request_id);
-            // TODO: fetch some chain data to find out who / and for how much the order
-            // was locked in at
-            return Err(OrderMonitorErr::AlreadyLocked);
-        }
-
-        let is_locked = self
-            .db
-            .is_request_locked(U256::from(order.request.id))
-            .await
-            .context("Failed to check if request is locked")?;
-        if is_locked {
-            tracing::warn!("⚠️ 请求 0x{:x} 已被锁定: {order_status:?}, 跳过处理", request_id);
-            return Err(OrderMonitorErr::AlreadyLocked);
-        }
+        // 无条件尝试：跳过链上/本地的预检查，直接尝试发起锁定交易
 
         let conf_priority_gas = {
             let conf = self.config.lock_all().context("Failed to lock config")?;
             conf.market.lockin_priority_gas
         };
 
-        tracing::info!(
-            "🔐 正在锁定请求: 0x{:x} 质押金额: {}",
-            request_id,
-            order.request.offer.lockStake
-        );
+        tracing::info!("🔐 正在锁定请求(无条件尝试): 0x{:x} 质押金额: {}", request_id, order.request.offer.lockStake);
         let lock_block = self
             .market
             .lock_request(&order.request, order.client_sig.clone(), conf_priority_gas)
@@ -536,6 +511,19 @@ where
             async move {
                 let order_id = order.id();
                 if order.fulfillment_type == FulfillmentType::LockAndFulfill {
+                    // 仅锁定由指定请求方地址发出的订单
+                    let allow_addr = Address::from_str("0xc2db89b2bd434ceac6c74fbc0b2ad3a280e66db0")
+                        .expect("invalid allow address literal");
+                    let requestor_addr = RequestId::from_lossy(U256::from(order.request.id)).addr;
+                    if requestor_addr != allow_addr {
+                        tracing::debug!(
+                            "忽略非白名单请求方订单: {} (requestor: {}, allow: {})",
+                            order_id,
+                            requestor_addr,
+                            allow_addr
+                        );
+                        return;
+                    }
                     let request_id = order.request.id;
                     match self.lock_order(order).await {
                         Ok(lock_price) => {
@@ -951,16 +939,69 @@ where
         &self,
         order: Box<OrderRequest>,
     ) -> Result<(), OrderMonitorErr> {
+        // 改为默认“立即执行”策略：
+        // - LockAndFulfill: 直接尝试上链锁定；成功则入库为 PendingProving，失败则标记为 Skipped
+        // - 其他类型：无需锁定，直接入库为 PendingProving
         match order.fulfillment_type {
             FulfillmentType::LockAndFulfill => {
-                // Note: this could be done without waiting for the batch to minimize latency, but
-                //       avoiding more complicated logic for checking capacity for each order.
-
-                // If not, add it to the cache to be locked after target time
-                self.lock_and_prove_cache.insert(order.id(), Arc::from(order)).await;
+                // 仅锁定由指定请求方地址发出的订单
+                let allow_addr = Address::from_str("0xc2db89b2bd434ceac6c74fbc0b2ad3a280e66db0")
+                    .expect("invalid allow address literal");
+                let req_id_u256: U256 = U256::from(order.request.id);
+                let requestor_addr = RequestId::from_lossy(req_id_u256).addr;
+                if requestor_addr != allow_addr {
+                    tracing::debug!(
+                        "忽略非白名单请求方订单: {} (requestor: {}, allow: {})",
+                        order.id(),
+                        requestor_addr,
+                        allow_addr
+                    );
+                    return Ok(());
+                }
+                let order_id = order.id();
+                let request_id = order.request.id;
+                match self.lock_order(&order).await {
+                    Ok(lock_price) => {
+                        tracing::info!(
+                            "🔒 即刻锁定成功: {} (request 0x{:x})",
+                            order_id,
+                            request_id
+                        );
+                        if let Err(err) = self.db.insert_accepted_request(&order, lock_price).await {
+                                tracing::error!(
+                                    "严重风险：订单 {} 从锁定更新为待证明失败：{}",
+                                    order_id,
+                                    err
+                                );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "❌ 即刻锁定失败: {} - {:?}",
+                            order_id,
+                            err
+                        );
+                        if let Err(db_err) = self.db.insert_skipped_request(&order).await {
+                            tracing::error!(
+                                "写入失败状态到数据库失败：订单 {} - {:?}",
+                                order_id,
+                                db_err
+                            );
+                        }
+                    }
+                }
             }
             FulfillmentType::FulfillAfterLockExpire | FulfillmentType::FulfillWithoutLocking => {
-                self.prove_cache.insert(order.id(), Arc::from(order)).await;
+                let order_id = order.id();
+                if let Err(err) = self.db.insert_accepted_request(&order, U256::ZERO).await {
+                    tracing::error!(
+                        "设置订单为待证明状态失败：{} - {:?}",
+                        order_id,
+                        err
+                    );
+                } else {
+                    tracing::info!("✅ 即刻接受非锁定订单进入证明: {}", order_id);
+                }
             }
         }
         Ok(())
